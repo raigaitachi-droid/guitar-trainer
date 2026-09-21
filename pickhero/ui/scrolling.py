@@ -26,11 +26,12 @@ from pickhero.ui.colors import (
 from pickhero.ui.feedback import FeedbackRenderer
 
 # Layout constants
-LANE_TOP_MARGIN = 80
-LANE_BOTTOM_MARGIN = 40
-MIN_NOTE_WIDTH_PX = 20
-NOTE_HEIGHT_FRACTION = 0.7
-NOTE_CORNER_RADIUS = 4
+LANE_TOP_MARGIN = 128
+LANE_BOTTOM_MARGIN = 62
+MIN_NOTE_WIDTH_PX = 30
+NOTE_HEIGHT_FRACTION = 0.42
+NOTE_CORNER_RADIUS = 7
+STRING_LABELS = ("e", "B", "G", "D", "A", "E")
 
 # Left margin for notes that already passed the hit zone (ms)
 LEFT_MARGIN_MS = 2000
@@ -457,6 +458,7 @@ class PlayingScreen:
         self._draw_loop_region(surface, layout)
         self._draw_hit_zone(surface, layout)
         self._draw_notes(surface, layout)
+        self._draw_string_labels(surface, layout)
         self._draw_hud(surface, layout)
 
         if self._show_help:
@@ -506,11 +508,37 @@ class PlayingScreen:
                 surface, bg,
                 (0, y, layout.screen_w, layout.lane_height),
             )
-            # Divider line at bottom of lane
-            line_y = int(y + layout.lane_height)
+            # A centered string line makes the view read like tablature rather
+            # than six large arcade lanes.
+            line_y = int(y + layout.lane_height / 2)
             pygame.draw.line(
                 surface, t.lane_line,
                 (0, line_y), (layout.screen_w, line_y),
+                2,
+            )
+
+    def _draw_string_labels(self, surface: pygame.Surface, layout: _Layout) -> None:
+        """Draw tuning labels above notes so every string stays identifiable."""
+        t = get_theme()
+        font = _get_font("consolas", 18)
+        for index, label in enumerate(STRING_LABELS):
+            center_y = int(
+                LANE_TOP_MARGIN + index * layout.lane_height + layout.lane_height / 2
+            )
+            text = font.render(label, True, t.hud_text)
+            pad_x, pad_y = 8, 4
+            bg_rect = pygame.Rect(
+                10,
+                center_y - text.get_height() // 2 - pad_y,
+                text.get_width() + pad_x * 2,
+                text.get_height() + pad_y * 2,
+            )
+            pygame.draw.rect(surface, t.bg, bg_rect, border_radius=6)
+            pygame.draw.rect(surface, t.lane_line, bg_rect, width=1, border_radius=6)
+            surface.blit(
+                text,
+                (bg_rect.centerx - text.get_width() // 2,
+                 bg_rect.centery - text.get_height() // 2),
             )
 
     def _draw_hit_zone(self, surface: pygame.Surface, layout: _Layout) -> None:
@@ -528,7 +556,7 @@ class PlayingScreen:
 
         notes = self._timeline.get_notes_in_range(view_start, view_end)
 
-        fret_font_size = max(12, int(layout.note_h * 0.55))
+        fret_font_size = min(22, max(14, int(layout.note_h * 0.55)))
         fret_font = _get_font("consolas", fret_font_size)
 
         for note in notes:
@@ -540,7 +568,12 @@ class PlayingScreen:
                 note.timestamp_ms, self._playback_ms,
                 layout.hit_zone_x, layout.pixels_per_ms,
             )
-            w = self.note_width(note.duration_ms, layout.pixels_per_ms)
+            fret_label = str(note.fret)
+            fret_text = fret_font.render(fret_label, True, t.note_text)
+            w = max(
+                self.note_width(note.duration_ms, layout.pixels_per_ms),
+                fret_text.get_width() + 12,
+            )
 
             # Skip notes fully off-screen
             if x + w < 0 or x > layout.screen_w:
@@ -564,23 +597,19 @@ class PlayingScreen:
             pygame.draw.rect(surface, color, rect, border_radius=NOTE_CORNER_RADIUS)
             pygame.draw.rect(surface, t.note_border, rect, width=2, border_radius=NOTE_CORNER_RADIUS)
 
-            # Fret number with outline, left-aligned inside note
-            fret_label = str(note.fret)
-            fret_text = fret_font.render(fret_label, True, t.note_text)
-            if fret_text.get_width() + 4 <= rect.width:
-                tx = rect.x + 4
-                ty = rect.y + rect.height // 2 - fret_text.get_height() // 2
-                # Black outline (render at offsets)
-                outline = fret_font.render(fret_label, True, (0, 0, 0))
-                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                    surface.blit(outline, (tx + dx, ty + dy))
-                surface.blit(fret_text, (tx, ty))
+            # Always show the fret number, including on short notes.
+            tx = rect.centerx - fret_text.get_width() // 2
+            ty = rect.centery - fret_text.get_height() // 2
+            outline = fret_font.render(fret_label, True, (0, 0, 0))
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                surface.blit(outline, (tx + dx, ty + dy))
+            surface.blit(fret_text, (tx, ty))
 
     def _draw_hud(self, surface: pygame.Surface, layout: _Layout) -> None:
         t = get_theme()
-        title_font = _get_font("arial", 20)
-        time_font = _get_font("consolas", 20)
-        hint_font = _get_font("arial", 14)
+        title_font = _get_font("arial", 19)
+        time_font = _get_font("consolas", 18)
+        hint_font = _get_font("arial", 13)
 
         meta = self._timeline.metadata
         w = layout.screen_w
@@ -608,6 +637,7 @@ class PlayingScreen:
         title = meta.title or "Untitled"
         if meta.artist:
             title = f"{meta.artist} — {title}"
+        title = self._ellipsize_text(title, title_font, int(w * 0.43))
         title_surf = title_font.render(title, True, t.hud_text)
         surface.blit(title_surf, (12, 12))
 
@@ -633,7 +663,7 @@ class PlayingScreen:
                 title_font,
                 hint_font,
                 w // 2,
-                68,
+                70,
                 self._playback_ms,
             )
 
@@ -687,17 +717,26 @@ class PlayingScreen:
             wait_state = f"|  W: wait {'WAIT' if self._wait_mode_frozen else 'ON'}  "
         elif self._audio_enabled:
             wait_state = "|  W: wait off  "
-        hint = (
-            f"{state}  |  SPACE: play/pause  |  LEFT/RIGHT: seek  "
-            f"|  HOME: restart  |  PgDn/PgUp: tempo  |  X/C: gate"
-            f"|  A: audio {audio_state}  "
-            f"{backing_state}"
-            f"{wait_state}"
-            f"|  I/O: loop {loop_state}  |  P: toggle  |  ESC: menu"
+        status = (
+            f"{state}   Tempo {int(self._tempo_factor * 100)}%   "
+            f"Audio {audio_state}   Wait {'ON' if self._wait_mode else 'off'}   "
+            f"Loop {loop_state}"
         )
-        hint_surf = hint_font.render(hint, True, t.hud_text)
-        y = layout.screen_h - LANE_BOTTOM_MARGIN + 8
-        surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, y))
+        controls = (
+            "SPACE Play/Pause   LEFT/RIGHT Seek   PgUp/PgDn Tempo   "
+            "I/O Loop   W Wait   H Help   ESC Menu"
+        )
+        footer_y = layout.screen_h - LANE_BOTTOM_MARGIN
+        status_surf = hint_font.render(status, True, t.hud_accent)
+        controls_surf = hint_font.render(controls, True, t.hud_text)
+        surface.blit(
+            status_surf,
+            (w // 2 - status_surf.get_width() // 2, footer_y + 7),
+        )
+        surface.blit(
+            controls_surf,
+            (w // 2 - controls_surf.get_width() // 2, footer_y + 30),
+        )
 
         # Top-left second line: track name + filter info
         info_y = 38
@@ -720,6 +759,17 @@ class PlayingScreen:
             chord_text = "Chords: strict" if self._chord_partial_credit else "Chords: easy"
             chord_surf = hint_font.render(chord_text, True, t.hud_accent)
             surface.blit(chord_surf, (12, info_y))
+
+    @staticmethod
+    def _ellipsize_text(text: str, font: pygame.font.Font, max_width: int) -> str:
+        """Shorten text with an ellipsis so HUD regions never overlap."""
+        if font.size(text)[0] <= max_width:
+            return text
+        suffix = "..."
+        shortened = text
+        while shortened and font.size(shortened + suffix)[0] > max_width:
+            shortened = shortened[:-1]
+        return shortened.rstrip() + suffix
 
     def _draw_signal_meter(self, surface: pygame.Surface, font: pygame.font.Font,
                            screen_w: int, y: int) -> None:

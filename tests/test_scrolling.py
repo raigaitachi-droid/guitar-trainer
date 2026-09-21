@@ -8,6 +8,8 @@ import pytest
 
 from pickhero.tabs.timeline import NoteEvent, SongMetadata, Timeline
 from pickhero.ui.scrolling import (
+    LANE_BOTTOM_MARGIN,
+    LANE_TOP_MARGIN,
     MIN_NOTE_WIDTH_PX,
     PlayingScreen,
     format_time,
@@ -117,6 +119,17 @@ class TestPlayingScreenLayout:
         usable = 1280 - layout.hit_zone_x
         assert layout.usable_width == pytest.approx(usable)
         assert layout.pixels_per_ms == pytest.approx(usable / expected_window)
+        assert layout.lane_height == pytest.approx(
+            (720 - LANE_TOP_MARGIN - LANE_BOTTOM_MARGIN) / 6
+        )
+
+    def test_all_six_strings_fit_above_footer(self):
+        timeline = _make_timeline()
+        screen = PlayingScreen(timeline)
+        layout = screen._layout(self._MockSurface(1280, 720))
+
+        lane_bottom = LANE_TOP_MARGIN + 6 * layout.lane_height
+        assert lane_bottom == pytest.approx(720 - LANE_BOTTOM_MARGIN)
 
     def test_layout_adapts_to_different_size(self):
         timeline = _make_timeline(tempo=120)
