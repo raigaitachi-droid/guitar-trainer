@@ -1,0 +1,53 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - our-app
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest pyinstaller
+
+      - name: Run tests
+        run: python -m pytest -q tests
+
+      - name: Build application
+        run: pyinstaller pickhero.spec --noconfirm
+
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist\GuitarTrainer.exe")) {
+            throw "GuitarTrainer.exe was not created"
+          }
+          Get-Item "dist\GuitarTrainer.exe" | Format-List Name, Length
+
+      - name: Upload Windows application
+        uses: actions/upload-artifact@v4
+        with:
+          name: GuitarTrainer-Windows-10
+          path: dist/GuitarTrainer.exe
+          if-no-files-found: error
+          retention-days: 14

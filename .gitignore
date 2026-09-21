@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Testing
+.pytest_cache/
+pytest-of-root/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# PyInstaller
+*.spec
+!pickhero.spec
+PickHero.exe
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Private planning docs
+PROJECT.md
+
+# AI/development config
+.claude/
+.mcp/
+
+# Songs directory content (GP files are large, user-specific)
+songs/*.gp3
+songs/*.gp4
+songs/*.gp5
+songs/*.gpx
+songs/*.gp
+!songs/.gitkeep
+
+# Temp files
+tmp/
+tmp*/
+pip-build-env-*/
+pip-build-tracker-*/
+pip-ephem-wheel-cache-*/
+pip-install-*/
+pip-metadata-*/
+pip-modern-metadata-*/
+pip-unpack-*/
+
+# User config
+pickhero_config.json
