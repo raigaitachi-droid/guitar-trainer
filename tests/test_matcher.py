@@ -20,7 +20,7 @@ def _note_event(timestamp_ms: float, midi_note: int = 64, string: int = 1,
 
 
 def _detected(midi_note: int, timestamp_ms: float, is_onset: bool = True,
-              confidence: float = 0.95) -> TimestampedNote:
+              confidence: float = 0.95, source: str = "yin") -> TimestampedNote:
     return TimestampedNote(
         note=DetectedNote(
             midi_note=midi_note,
@@ -28,6 +28,7 @@ def _detected(midi_note: int, timestamp_ms: float, is_onset: bool = True,
             confidence=confidence,
             name="A4",  # placeholder
             is_onset=is_onset,
+            source=source,
         ),
         timestamp_ms=timestamp_ms,
     )
@@ -124,6 +125,18 @@ class TestWrongNoteFeedback:
         assert any(result.match_type == MatchType.HIT for result in results)
         assert matcher.get_note_state(tab_note) == MatchType.HIT
 
+    def test_octave_is_not_accepted_as_the_same_tab_note(self):
+        tab_note = _note_event(1000.0, midi_note=64)
+        matcher = _make_matcher([tab_note])
+
+        results = matcher.process_detected_notes(
+            [_detected(52, 1000.0)], 1000.0
+        )
+
+        assert not any(result.match_type == MatchType.HIT for result in results)
+        assert any(result.match_type == MatchType.WRONG for result in results)
+        assert matcher.get_note_state(tab_note) == MatchType.PENDING
+
 
 class TestMissedNote:
     def test_advance_past_window_without_detection(self):
@@ -191,6 +204,61 @@ class TestOnsetOnly:
         hit_close = [r for r in results if r.match_type in (MatchType.HIT, MatchType.CLOSE)]
         assert len(hit_close) == 0
         assert matcher.get_note_state(tab_note) == MatchType.PENDING
+
+    def test_wait_mode_can_accept_sustained_pitch(self):
+        """A re-armed guided pitch can release a frozen Wait Mode."""
+        tab_note = _note_event(1000.0, midi_note=64)
+        matcher = _make_matcher([tab_note])
+
+        detected = [_detected(
+            64, 1000.0, is_onset=False, source="guided"
+        )]
+        results = matcher.process_detected_notes(
+            detected,
+            1000.0,
+            allow_sustained=True,
+        )
+
+        assert any(result.match_type == MatchType.HIT for result in results)
+        assert matcher.get_note_state(tab_note) == MatchType.HIT
+
+    def test_wait_mode_rejects_ungated_sustained_yin_pitch(self):
+        """A ringing prior string must not auto-complete the next tab event."""
+        tab_note = _note_event(1000.0, midi_note=64)
+        matcher = _make_matcher([tab_note])
+
+        results = matcher.process_detected_notes(
+            [_detected(64, 1000.0, is_onset=False, source="yin")],
+            1000.0,
+            allow_sustained=True,
+        )
+
+        assert not any(result.match_type == MatchType.HIT for result in results)
+        assert matcher.get_note_state(tab_note) == MatchType.PENDING
+
+
+class TestWaitModePendingNote:
+    def test_returns_exact_pending_note_timestamp(self):
+        tab_note = _note_event(1000.0, midi_note=64)
+        matcher = _make_matcher([tab_note])
+
+        assert matcher.pending_note_time_at(1015.0) == pytest.approx(1000.0)
+
+    def test_returns_none_after_note_is_hit(self):
+        tab_note = _note_event(1000.0, midi_note=64)
+        matcher = _make_matcher([tab_note])
+        matcher.process_detected_notes([_detected(64, 1000.0)], 1000.0)
+
+        assert matcher.pending_note_time_at(1015.0) is None
+
+    def test_expected_target_distinguishes_repeated_same_pitch_events(self):
+        first = _note_event(1000.0, midi_note=64)
+        second = _note_event(1200.0, midi_note=64)
+        matcher = _make_matcher([first, second])
+
+        assert matcher.expected_target_at(1000.0) == (1000.0, (64,))
+        matcher.process_detected_notes([_detected(64, 1000.0)], 1000.0)
+        assert matcher.expected_target_at(1100.0) == (1200.0, (64,))
 
 
 class TestTimingWindow:

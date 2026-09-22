@@ -25,10 +25,15 @@ class AudioConfig:
     device_index: int | None = None  # None = system default
     sample_rate: int = 44100
     buf_size: int = 2048
-    hop_size: int = 512
-    confidence_threshold: float = 0.8
-    onset_threshold: float = 0.3
-    noise_gate_db: float = -60.0  # ignore signals below this dB level
+    # Keep the longer YIN window needed for low guitar notes, but feed it at
+    # 256-frame intervals. At 48 kHz this halves callback/onset granularity
+    # from ~10.7 ms to ~5.3 ms without sacrificing low-E pitch stability.
+    hop_size: int = 256
+    # Acoustic-guitar preset: sensitive enough for a laptop microphone while
+    # still rejecting ordinary room noise.
+    confidence_threshold: float = 0.65
+    onset_threshold: float = 0.2
+    noise_gate_db: float = -70.0  # ignore signals below this dB level
 
 
 @dataclass
@@ -36,6 +41,7 @@ class DisplayConfig:
     """Display and rendering settings."""
     width: int = 1280
     height: int = 720
+    fullscreen: bool = True
     visible_beats: int = 16
     hit_zone_fraction: float = 0.20
 
@@ -101,6 +107,16 @@ class Config:
             data.pop("_default_chord_partial_credit", None)
             audio_data = data.pop("audio", {})
             display_data = data.pop("display", {})
+            # Migrate the original electric/interface-oriented detector values
+            # to the more sensitive acoustic/laptop-microphone preset.
+            if audio_data.get("confidence_threshold", 0.8) >= 0.8:
+                audio_data["confidence_threshold"] = 0.65
+            if audio_data.get("onset_threshold", 0.3) >= 0.3:
+                audio_data["onset_threshold"] = 0.2
+            # Migrate the original 512-frame callback cadence to the
+            # low-latency preset. Users can still override this in settings.
+            if audio_data.get("hop_size", 512) >= 512:
+                audio_data["hop_size"] = 256
             return cls(
                 audio=AudioConfig(**audio_data),
                 display=DisplayConfig(**display_data),

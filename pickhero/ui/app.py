@@ -34,6 +34,11 @@ class App:
         self._device_menu: DeviceMenuScreen | None = None
         self._download_menu: DownloadMenuScreen | None = None
         self._calibration_menu: CalibrationMenuScreen | None = None
+        self._fullscreen = bool(self._config.display.fullscreen)
+        self._windowed_size = (
+            self._config.display.width,
+            self._config.display.height,
+        )
 
     def run(self) -> None:
         """Initialize PyGame, run main loop, clean up."""
@@ -54,9 +59,10 @@ class App:
         pygame.display.set_caption("Guitar Trainer")
 
         dc = self._config.display
-        surface = pygame.display.set_mode(
-            (dc.width, dc.height), pygame.RESIZABLE
-        )
+        if self._fullscreen:
+            surface = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        else:
+            surface = pygame.display.set_mode(self._windowed_size, pygame.RESIZABLE)
         clock = pygame.time.Clock()
 
         songs_dir = Path(self._config.songs_dir)
@@ -65,7 +71,7 @@ class App:
         self._running = True
 
         while self._running:
-            self._process_events(surface)
+            surface = self._process_events(surface)
             self._update()
             self._render(surface)
             pygame.display.flip()
@@ -73,15 +79,24 @@ class App:
 
         pygame.quit()
 
-    def _process_events(self, surface: pygame.Surface) -> None:
+    def _process_events(self, surface: pygame.Surface) -> pygame.Surface:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self._running = False
-                return
+                return surface
 
-            if event.type == pygame.VIDEORESIZE:
+            # F11 (or Alt+Enter) is available from every screen.
+            if (event.type == pygame.KEYDOWN
+                    and (event.key == pygame.K_F11
+                         or (event.key == pygame.K_RETURN
+                             and event.mod & pygame.KMOD_ALT))):
+                surface = self._toggle_fullscreen()
+                continue
+
+            if event.type == pygame.VIDEORESIZE and not self._fullscreen:
+                self._windowed_size = (max(800, event.w), max(600, event.h))
                 surface = pygame.display.set_mode(
-                    (event.w, event.h), pygame.RESIZABLE
+                    self._windowed_size, pygame.RESIZABLE
                 )
 
             if self._state == "menu":
@@ -94,6 +109,19 @@ class App:
                 self._handle_download_event(event)
             elif self._state == "calibration":
                 self._handle_calibration_event(event)
+
+        return surface
+
+    def _toggle_fullscreen(self) -> pygame.Surface:
+        """Switch between desktop fullscreen and a resizable window."""
+        self._fullscreen = not self._fullscreen
+        self._config.display.fullscreen = self._fullscreen
+        if self._fullscreen:
+            surface = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        else:
+            surface = pygame.display.set_mode(self._windowed_size, pygame.RESIZABLE)
+        self._config.save()
+        return surface
 
     def _handle_menu_event(self, event: pygame.event.Event) -> None:
         if event.type == pygame.KEYDOWN and not self._menu.is_searching:
@@ -188,6 +216,9 @@ class App:
             song_key=path.stem,
         )
         self._state = "playing"
+        # Open the microphone immediately. This makes permissions/device
+        # failures visible before the user starts the song.
+        self._playing_screen.start_monitoring()
 
         # Skip ahead so the first note is just entering the visible window
         if timeline.notes:

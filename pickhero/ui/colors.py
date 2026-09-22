@@ -1,7 +1,4 @@
-"""Color constants for PickHero UI.
-
-Rocksmith-style string palette. Supports dark/light themes via Theme dataclass.
-"""
+"""Color constants for Guitar Trainer's friendly practice UI."""
 
 from dataclasses import dataclass
 
@@ -60,24 +57,24 @@ class Theme:
 
 
 DARK_THEME = Theme(
-    bg=(20, 20, 30),
-    lane_bg_even=(30, 30, 42),
-    lane_bg_odd=(25, 25, 36),
-    lane_line=(60, 60, 80),
-    hit_zone=(255, 255, 255),
+    bg=(12, 17, 26),
+    lane_bg_even=(20, 29, 42),
+    lane_bg_odd=(18, 26, 38),
+    lane_line=(77, 91, 112),
+    hit_zone=(114, 239, 221),
     note_text=(255, 255, 255),
-    note_border=(10, 10, 15),
-    menu_bg=(20, 20, 30),
-    menu_item=(180, 180, 200),
+    note_border=(9, 14, 22),
+    menu_bg=(12, 17, 26),
+    menu_item=(190, 200, 216),
     menu_selected=(255, 255, 255),
-    menu_selected_bg=(60, 60, 100),
-    menu_check=(50, 220, 80),
-    hud_text=(200, 200, 220),
-    hud_accent=(100, 180, 255),
-    feedback_hit=(50, 255, 50),
-    feedback_close=(255, 220, 50),
-    feedback_miss=(255, 50, 50),
-    feedback_streak=(255, 180, 50),
+    menu_selected_bg=(35, 66, 83),
+    menu_check=(70, 218, 151),
+    hud_text=(218, 227, 239),
+    hud_accent=(99, 220, 203),
+    feedback_hit=(67, 220, 145),
+    feedback_close=(255, 205, 79),
+    feedback_miss=(255, 95, 114),
+    feedback_streak=(255, 194, 75),
     loop_marker=(0, 200, 255),
     loop_marker_disabled=(0, 80, 110),
     loop_region=(0, 200, 255, 25),
@@ -152,15 +149,15 @@ def cycle_theme() -> str:
     return "dark"
 
 
-# String colors (Rocksmith palette, keyed 1-6: 1=high E, 6=low E)
-# These don't change with theme — they're gameplay identifiers.
+# Friendly high-contrast palette, keyed 1-6: 1=high E, 6=low E.
+# The colors are deliberately softer than the old arcade palette.
 STRING_COLORS: dict[int, tuple[int, int, int]] = {
-    1: (200, 50, 50),    # red
-    2: (220, 200, 40),   # yellow
-    3: (50, 120, 220),   # blue
-    4: (220, 140, 30),   # orange
-    5: (50, 180, 70),    # green
-    6: (140, 60, 200),   # purple
+    1: (245, 92, 112),   # coral
+    2: (245, 198, 66),   # sunflower
+    3: (73, 154, 240),   # sky blue
+    4: (242, 151, 55),   # orange
+    5: (68, 203, 137),   # mint
+    6: (166, 101, 232),  # violet
 }
 
 

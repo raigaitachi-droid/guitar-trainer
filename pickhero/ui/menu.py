@@ -30,7 +30,7 @@ SORT_LABELS = {
 
 def _get_font(name: str, size: int) -> pygame.font.Font:
     """Try to load a system font with fallbacks."""
-    for family in (name, "Courier New", "monospace"):
+    for family in (name, "Segoe UI", "Arial", "sans-serif"):
         font = pygame.font.SysFont(family, size)
         if font:
             return font
@@ -53,6 +53,7 @@ class MenuScreen:
         self._selected = 0
         self._scroll_offset = 0
         self._last_click_time = 0
+        self._visible_items = VISIBLE_ITEMS
         self._device_name = self._resolve_device_name()
         self.scan_files()
 
@@ -191,13 +192,13 @@ class MenuScreen:
                 return None
             if event.key == pygame.K_PAGEUP:
                 if files:
-                    self._selected = max(0, self._selected - VISIBLE_ITEMS)
+                    self._selected = max(0, self._selected - self._visible_items)
                     self._ensure_visible()
                 return None
             if event.key == pygame.K_PAGEDOWN:
                 if files:
                     self._selected = min(
-                        len(files) - 1, self._selected + VISIBLE_ITEMS
+                        len(files) - 1, self._selected + self._visible_items
                     )
                     self._ensure_visible()
                 return None
@@ -245,40 +246,49 @@ class MenuScreen:
         return None
 
     def render(self, surface: pygame.Surface) -> None:
-        """Draw the menu screen."""
+        """Draw a modern lesson library with large, readable song cards."""
         t = get_theme()
         surface.fill(t.menu_bg)
         w, h = surface.get_size()
         files = self._display_files
+        scale = max(1.0, min(1.35, h / 720.0))
 
-        title_font = _get_font("arial", 36)
-        item_font = _get_font("consolas", 22)
-        hint_font = _get_font("arial", 16)
+        title_font = _get_font("Segoe UI Semibold", int(38 * scale))
+        item_font = _get_font("Segoe UI Semibold", int(19 * scale))
+        hint_font = _get_font("Segoe UI", int(14 * scale))
+        eyebrow_font = _get_font("Segoe UI Semibold", int(11 * scale))
 
-        # Title
-        title_surf = title_font.render("PickHero", True, t.hud_accent)
-        surface.blit(title_surf, (w // 2 - title_surf.get_width() // 2, 24))
+        # App header
+        content_w = min(1120, w - 80)
+        content_left = (w - content_w) // 2
+        eyebrow = eyebrow_font.render("YOUR PRACTICE SPACE", True, t.hud_accent)
+        surface.blit(eyebrow, (content_left, 28))
+        title_surf = title_font.render("Choose your next song", True, t.menu_selected)
+        surface.blit(title_surf, (content_left, 48))
 
-        # Subtitle
         sub_surf = hint_font.render(
-            "Select a song to play", True, t.hud_text
+            f"{len(files)} songs ready  •  Build accuracy one phrase at a time", True, (137, 154, 176)
         )
-        surface.blit(sub_surf, (w // 2 - sub_surf.get_width() // 2, 68))
+        surface.blit(sub_surf, (content_left, 99))
 
-        list_top = 110
-        item_h = 30
-        list_left = 60
-        list_width = w - 120
+        list_top = 145
+        item_h = max(58, int(62 * scale))
+        list_left = content_left
+        list_width = content_w
+        self._visible_items = max(1, min(VISIBLE_ITEMS, (h - list_top - 118) // item_h))
 
         # Search bar
         if self._search_active:
-            search_label = f"Filter: {self._search_text}_"
+            search_label = f"Search songs:  {self._search_text}_"
             search_surf = item_font.render(search_label, True, t.hud_accent)
-            surface.blit(search_surf, (list_left, 90))
+            search_box = pygame.Rect(list_left, 115, list_width, 48)
+            pygame.draw.rect(surface, (20, 34, 49), search_box, border_radius=14)
+            pygame.draw.rect(surface, t.hud_accent, search_box, 2, border_radius=14)
+            surface.blit(search_surf, (list_left + 18, 124))
             count_label = f"({len(files)} of {len(self._files)} songs)"
             count_surf = hint_font.render(count_label, True, t.hud_text)
-            surface.blit(count_surf, (list_left + search_surf.get_width() + 12, 95))
-            list_top = 120
+            surface.blit(count_surf, (search_box.right - count_surf.get_width() - 18, 130))
+            list_top = 180
 
         # Empty states
         if not files:
@@ -292,25 +302,30 @@ class MenuScreen:
             surface.blit(msg_surf, (w // 2 - msg_surf.get_width() // 2, h // 2))
         else:
             # File list
-            visible_end = min(self._scroll_offset + VISIBLE_ITEMS, len(files))
+            visible_end = min(self._scroll_offset + self._visible_items, len(files))
             for i in range(self._scroll_offset, visible_end):
                 y = list_top + (i - self._scroll_offset) * item_h
+                card = pygame.Rect(list_left, y, list_width, item_h - 8)
                 if i == self._selected:
-                    pygame.draw.rect(
-                        surface,
-                        t.menu_selected_bg,
-                        (list_left - 8, y, list_width, item_h),
-                        border_radius=4,
-                    )
+                    pygame.draw.rect(surface, (6, 10, 17), card.move(0, 4), border_radius=14)
+                    pygame.draw.rect(surface, (29, 53, 67), card, border_radius=14)
+                    pygame.draw.rect(surface, t.hud_accent, card, 2, border_radius=14)
+                    pygame.draw.rect(surface, t.hud_accent, (card.x, card.y + 12, 5, card.height - 24), border_radius=3)
                     color = t.menu_selected
                 else:
+                    pygame.draw.rect(surface, (17, 27, 41), card, border_radius=14)
+                    pygame.draw.rect(surface, (40, 54, 72), card, 1, border_radius=14)
                     color = t.menu_item
 
-                # Show relative path for subfolder files, just name for root
                 rel = files[i].relative_to(self._songs_dir)
-                label = str(rel) if len(rel.parts) > 1 else files[i].name
+                label = str(rel.with_suffix("")) if len(rel.parts) > 1 else files[i].stem
+                # Circular lesson marker
+                marker = (card.x + 30, card.centery)
+                pygame.draw.circle(surface, t.hud_accent if i == self._selected else (58, 78, 99), marker, 14)
+                play = [(marker[0] - 3, marker[1] - 6), (marker[0] - 3, marker[1] + 6), (marker[0] + 7, marker[1])]
+                pygame.draw.polygon(surface, (8, 18, 24), play)
                 text_surf = item_font.render(label, True, color)
-                surface.blit(text_surf, (list_left, y + 4))
+                surface.blit(text_surf, (card.x + 57, card.centery - text_surf.get_height() // 2))
 
                 # Show attempts + best accuracy if available
                 if self._progress is not None:
@@ -318,13 +333,17 @@ class MenuScreen:
                     if record is not None and record.attempts > 0:
                         pct = f"{record.best_accuracy:.0f}%"
                         pct_surf = item_font.render(pct, True, t.hud_accent)
-                        pct_x = list_left + list_width - pct_surf.get_width() - 8
-                        surface.blit(pct_surf, (pct_x, y + 4))
+                        pct_x = card.right - pct_surf.get_width() - 22
+                        surface.blit(pct_surf, (pct_x, card.centery - pct_surf.get_height() // 2))
 
                         att = f"{record.attempts}x"
                         att_surf = item_font.render(att, True, t.hud_text)
                         att_x = pct_x - att_surf.get_width() - 12
-                        surface.blit(att_surf, (att_x, y + 4))
+                        surface.blit(att_surf, (att_x, card.centery - att_surf.get_height() // 2))
+
+                if i == self._selected and self._progress is None:
+                    action = hint_font.render("ENTER TO PRACTICE", True, t.hud_accent)
+                    surface.blit(action, (card.right - action.get_width() - 22, card.centery - action.get_height() // 2))
 
             # Scroll indicators
             if self._scroll_offset > 0:
@@ -332,27 +351,25 @@ class MenuScreen:
                 surface.blit(arrow, (w // 2 - arrow.get_width() // 2, list_top - 20))
             if visible_end < len(files):
                 arrow = hint_font.render("▼ more", True, t.hud_text)
-                y_bottom = list_top + VISIBLE_ITEMS * item_h + 4
+                y_bottom = list_top + self._visible_items * item_h + 4
                 surface.blit(arrow, (w // 2 - arrow.get_width() // 2, y_bottom))
 
         # Current audio device
-        dev_text = f"Audio: {self._device_name}"
+        dev_text = f"●  MICROPHONE   {self._device_name}"
         dev_surf = hint_font.render(dev_text, True, t.hud_text)
-        surface.blit(dev_surf, (w // 2 - dev_surf.get_width() // 2, h - 72))
-
-        # Scoring hint
-        score_hint = "Press A during playback to enable scoring"
-        score_surf = hint_font.render(score_hint, True, t.hud_text)
-        surface.blit(score_surf, (w // 2 - score_surf.get_width() // 2, h - 56))
+        mic_box = dev_surf.get_rect(topleft=(content_left, h - 72)).inflate(24, 16)
+        pygame.draw.rect(surface, (20, 34, 49), mic_box, border_radius=12)
+        pygame.draw.rect(surface, (50, 73, 91), mic_box, 1, border_radius=12)
+        surface.blit(dev_surf, (mic_box.x + 12, mic_box.y + 8))
 
         # Controls hint
         if self._search_active:
             hint = "Type to filter  |  BACKSPACE: edit  |  ESC: exit filter  |  ENTER: select  |  UP/DOWN: navigate"
         else:
             sort_label = SORT_LABELS.get(self._sort_mode, "Name A-Z")
-            hint = f"F: filter  |  N: sort ({sort_label})  |  UP/DOWN: navigate  |  ENTER: select  |  S: search online  |  D: audio device  |  G: calibrate  |  T: theme  |  ESC: quit"
-        hint_surf = hint_font.render(hint, True, t.hud_text)
-        surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, h - 36))
+            hint = f"F: filter  |  N: sort ({sort_label})  |  UP/DOWN: navigate  |  ENTER: select  |  S: search online  |  D: microphone  |  F11: fullscreen  |  ESC: quit"
+        hint_surf = hint_font.render(hint, True, (126, 144, 165))
+        surface.blit(hint_surf, (content_left, h - 28))
 
         # Store layout for hit testing
         self._list_top = list_top
@@ -364,8 +381,8 @@ class MenuScreen:
         """Adjust scroll offset so selected item is visible."""
         if self._selected < self._scroll_offset:
             self._scroll_offset = self._selected
-        elif self._selected >= self._scroll_offset + VISIBLE_ITEMS:
-            self._scroll_offset = self._selected - VISIBLE_ITEMS + 1
+        elif self._selected >= self._scroll_offset + self._visible_items:
+            self._scroll_offset = self._selected - self._visible_items + 1
 
     def _hit_test(self, pos: tuple[int, int]) -> int | None:
         """Return index of file at mouse position, or None."""

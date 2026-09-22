@@ -131,3 +131,63 @@ class TestPitchDetector:
         # Should still work
         note = self._detect_note_from_sine(detector, 440.0)
         assert note == 69
+
+
+class TestTabGuidedArpeggioDetector:
+    """Verify expected notes survive polyphonic ringing from prior strings."""
+
+    @staticmethod
+    def _guitar_tone(midi_note: int, sample_rate: int, duration_s: float,
+                     amplitude: float) -> np.ndarray:
+        count = int(sample_rate * duration_s)
+        t = np.arange(count, dtype=np.float32) / sample_rate
+        freq = midi_to_freq(midi_note)
+        signal = np.zeros(count, dtype=np.float32)
+        for harmonic in range(1, 7):
+            signal += (
+                amplitude / harmonic
+                * np.sin(2 * np.pi * freq * harmonic * t)
+            ).astype(np.float32)
+        return (signal * np.exp(-2.0 * t)).astype(np.float32)
+
+    def test_new_octave_requires_repick_then_detects_over_ringing_string(self):
+        sample_rate = 48_000
+        hop = 256
+        duration_s = 0.6
+        detector = PitchDetector(
+            buf_size=2048,
+            hop_size=hop,
+            sample_rate=sample_rate,
+            confidence_threshold=0.65,
+            onset_threshold=0.2,
+            noise_gate_db=-70.0,
+        )
+
+        # E3 keeps ringing. Its second harmonic is E4, so a naive spectral
+        # detector would falsely accept the upcoming octave immediately.
+        mix = self._guitar_tone(52, sample_rate, duration_s, 0.35)
+        target_start = int(0.28 * sample_rate)
+        target = self._guitar_tone(64, sample_rate, duration_s, 0.24)
+        mix[target_start:] += target[:len(mix) - target_start]
+
+        guided_before_pick = []
+        guided_after_pick = []
+        armed = False
+        for i in range(0, len(mix) - hop + 1, hop):
+            time_s = i / sample_rate
+            if not armed and time_s >= 0.15:
+                detector.set_expected_notes([64], target_token=1000.0)
+                armed = True
+            result = detector.process(mix[i:i + hop])
+            if result is None or result.source != "guided":
+                continue
+            if time_s < 0.28:
+                guided_before_pick.append(result)
+            else:
+                guided_after_pick.append((time_s, result))
+
+        assert guided_before_pick == []
+        assert guided_after_pick
+        first_time_s, first_result = guided_after_pick[0]
+        assert first_result.midi_note == 64
+        assert first_time_s - 0.28 < 0.06

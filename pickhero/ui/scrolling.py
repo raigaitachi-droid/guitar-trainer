@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import pygame
 
+from pickhero.analysis.structure import analyze_structure
 from pickhero.audio.midi_playback import BackingTrack, MidiPlayer
 from pickhero.config import Config
 from pickhero.matcher import NoteMatcher
@@ -26,12 +27,20 @@ from pickhero.ui.colors import (
 from pickhero.ui.feedback import FeedbackRenderer
 
 # Layout constants
-LANE_TOP_MARGIN = 128
-LANE_BOTTOM_MARGIN = 62
+LANE_TOP_MARGIN = 154
+LANE_BOTTOM_MARGIN = 92
 MIN_NOTE_WIDTH_PX = 30
-NOTE_HEIGHT_FRACTION = 0.42
-NOTE_CORNER_RADIUS = 7
+NOTE_HEIGHT_FRACTION = 0.52
+NOTE_CORNER_RADIUS = 12
 STRING_LABELS = ("e", "B", "G", "D", "A", "E")
+SECTION_COLORS = (
+    (78, 205, 188),
+    (77, 145, 235),
+    (168, 104, 232),
+    (242, 159, 67),
+    (239, 91, 116),
+    (105, 190, 104),
+)
 
 # Left margin for notes that already passed the hit zone (ms)
 LEFT_MARGIN_MS = 2000
@@ -44,7 +53,7 @@ FRET_LIMITS = [24, 12, 7, 5, 3]
 
 def _get_font(name: str, size: int) -> pygame.font.Font:
     """Try to load a system font with fallbacks."""
-    for family in (name, "Courier New", "monospace"):
+    for family in (name, "Segoe UI", "Arial", "sans-serif"):
         font = pygame.font.SysFont(family, size)
         if font:
             return font
@@ -85,6 +94,7 @@ class PlayingScreen:
         self._visible_beats = visible_beats
         self._hit_zone_fraction = hit_zone_fraction
         self._config = config or Config()
+        self._structure = analyze_structure(timeline)
 
         self._tempo_factor = max(0.5, min(1.0, self._config.tempo_factor))
 
@@ -103,6 +113,8 @@ class PlayingScreen:
 
         # Audio matching
         self._audio_capture = None  # AudioCapture, created on demand
+        self._audio_error: str | None = None
+        self._audio_started_at: float = 0.0
         self._matcher: NoteMatcher | None = None
         self._feedback = FeedbackRenderer()
         self._audio_enabled = True
@@ -146,10 +158,12 @@ class PlayingScreen:
 
         # Help overlay
         self._show_help: bool = False
+        self._show_latency_details: bool = False
 
         # Wait mode
         self._wait_mode: bool = self._config.wait_mode
         self._wait_mode_frozen: bool = False
+        self._wait_mode_hold_ms: float | None = None
 
     def _note_passes_filter(self, note: NoteEvent) -> bool:
         """Check if a note passes the difficulty filter."""
@@ -187,15 +201,24 @@ class PlayingScreen:
         self._playing = not self._playing
         if self._playing:
             self._last_tick = time.perf_counter()
-            # Only start audio capture when past count-in
-            if self._audio_enabled and self._playback_ms >= 0:
-                self._start_audio()
+            if self._audio_enabled:
+                if self._playback_ms >= 0:
+                    self._start_audio()
+                else:
+                    # Pre-warm the Windows device throughout count-in.
+                    self._start_capture_only()
             if self._midi_player is not None:
                 if self._playback_ms >= 0:
                     self._midi_player.seek(self._playback_ms)
         else:
             self._last_tick = None
-            self._stop_audio()
+            # Keep a lightweight monitoring stream active while paused so the
+            # signal meter immediately proves whether Windows is supplying mic
+            # audio.
+            if self._audio_enabled:
+                self._start_capture_only()
+            else:
+                self._stop_audio()
             if self._midi_player is not None:
                 self._midi_player.pause()
 
@@ -207,9 +230,8 @@ class PlayingScreen:
         self._feedback.reset()
         if self._midi_player is not None:
             self._midi_player.seek(self._playback_ms)
-        # Restart audio with new offset if active
+        # Re-arm audio timing with the stream kept open.
         if self._audio_enabled and self._playing:
-            self._stop_audio()
             self._start_audio()
 
     def is_playing(self) -> bool:
@@ -275,6 +297,16 @@ class PlayingScreen:
                     self._tuner_displayed_note = -1
                     self._tuner_note_stable_frames = 0
 
+            # An opened stream with no callbacks usually means Windows privacy
+            # settings or the chosen input device is blocking microphone data.
+            if (self._audio_started_at > 0
+                    and time.perf_counter() - self._audio_started_at > 2.0
+                    and not self._audio_capture.is_receiving_audio()):
+                self._audio_error = "No microphone data from Windows"
+            elif (self._audio_error == "No microphone data from Windows"
+                    and self._audio_capture.is_receiving_audio()):
+                self._audio_error = None
+
         if not self._playing:
             return
 
@@ -288,14 +320,20 @@ class PlayingScreen:
         # Wait mode: freeze if there are pending notes the player hasn't hit yet
         if (self._wait_mode and self._audio_enabled
                 and self._playback_ms >= 0 and self._matcher is not None):
-            if self._matcher.has_pending_notes_at(self._playback_ms):
-                self._playback_ms = prev_ms
+            pending_time = self._matcher.pending_note_time_at(self._playback_ms)
+            if pending_time is not None:
+                if not self._wait_mode_frozen or self._wait_mode_hold_ms is None:
+                    self._wait_mode_hold_ms = pending_time
+                # Lock to one exact timestamp on every frame. Merely setting
+                # the frozen flag still lets the normal clock creep forward.
+                self._playback_ms = self._wait_mode_hold_ms
                 self._last_tick = now
                 self._wait_mode_frozen = True
                 if self._midi_player is not None and not self._backing_muted:
                     self._midi_player.pause()
             elif self._wait_mode_frozen:
                 self._wait_mode_frozen = False
+                self._wait_mode_hold_ms = None
                 if self._midi_player is not None and not self._backing_muted:
                     self._midi_player.seek(self._playback_ms)
 
@@ -320,6 +358,12 @@ class PlayingScreen:
                 and self._audio_enabled
                 and self._audio_capture is not None
                 and self._matcher is not None):
+            target = self._matcher.expected_target_at(self._playback_ms)
+            if target is None:
+                self._audio_capture.set_expected_notes(())
+            else:
+                target_time, target_midis = target
+                self._audio_capture.set_expected_notes(target_midis, target_time)
             detected = self._audio_capture.get_notes()
             for d in detected:
                 d.timestamp_ms *= self._tempo_factor
@@ -330,7 +374,11 @@ class PlayingScreen:
                 pinned_ts = self._playback_ms - self._matcher.audio_offset_ms
                 for d in detected:
                     d.timestamp_ms = pinned_ts
-            results = self._matcher.process_detected_notes(detected, self._playback_ms)
+            results = self._matcher.process_detected_notes(
+                detected,
+                self._playback_ms,
+                allow_sustained=self._wait_mode_frozen,
+            )
             self._feedback.add_results(results, self._playback_ms)
             self._feedback.cleanup(self._playback_ms)
 
@@ -353,7 +401,6 @@ class PlayingScreen:
             if self._midi_player is not None:
                 self._midi_player.seek(self._loop_start_ms)
             if self._audio_enabled and self._playing:
-                self._stop_audio()
                 self._start_audio()
             return
 
@@ -363,7 +410,10 @@ class PlayingScreen:
             self._last_tick = None
             if self._midi_player is not None:
                 self._midi_player.pause()
-            self._stop_audio()
+            if self._audio_enabled:
+                self._start_capture_only()
+            else:
+                self._stop_audio()
 
             if not self._song_completed:
                 if (self._audio_enabled
@@ -445,6 +495,17 @@ class PlayingScreen:
             self._show_help = not self._show_help
         elif event.key == pygame.K_w:
             self._toggle_wait_mode()
+        elif event.key == pygame.K_TAB:
+            direction = -1 if event.mod & pygame.KMOD_SHIFT else 1
+            self._seek_adjacent_section(direction)
+        elif event.key in (pygame.K_LEFTBRACKET, pygame.K_F7):
+            self._adjust_latency(-10.0)
+        elif event.key in (pygame.K_RIGHTBRACKET, pygame.K_F8):
+            self._adjust_latency(10.0)
+        elif event.key in (pygame.K_r, pygame.K_F9):
+            self._set_latency_offset(0.0)
+        elif event.key == pygame.K_F10:
+            self._show_latency_details = not self._show_latency_details
 
         return None
 
@@ -454,6 +515,7 @@ class PlayingScreen:
         layout = self._layout(surface)
 
         surface.fill(t.bg)
+        self._draw_stage_background(surface, layout)
         self._draw_lanes(surface, layout)
         self._draw_loop_region(surface, layout)
         self._draw_hit_zone(surface, layout)
@@ -463,6 +525,25 @@ class PlayingScreen:
 
         if self._show_help:
             self._draw_help_overlay(surface, layout)
+
+    def _draw_stage_background(self, surface: pygame.Surface, layout: _Layout) -> None:
+        """Draw a layered app shell and a raised practice surface."""
+        pygame.draw.rect(surface, (8, 13, 21), (0, 0, layout.screen_w, LANE_TOP_MARGIN))
+        footer_y = layout.screen_h - LANE_BOTTOM_MARGIN
+        pygame.draw.rect(
+            surface, (10, 15, 23),
+            (0, footer_y, layout.screen_w, LANE_BOTTOM_MARGIN),
+        )
+        pygame.draw.line(surface, (39, 51, 67), (0, footer_y), (layout.screen_w, footer_y))
+
+        # The track reads as one intentional surface instead of a spreadsheet.
+        track_rect = pygame.Rect(
+            14, LANE_TOP_MARGIN - 10,
+            layout.screen_w - 28, footer_y - LANE_TOP_MARGIN + 20,
+        )
+        pygame.draw.rect(surface, (5, 10, 17), track_rect.move(0, 6), border_radius=22)
+        pygame.draw.rect(surface, (17, 27, 41), track_rect, border_radius=22)
+        pygame.draw.rect(surface, (45, 61, 79), track_rect, 1, border_radius=22)
 
     # -- Pure math helpers (testable without display) --
 
@@ -503,38 +584,42 @@ class PlayingScreen:
         t = get_theme()
         for i in range(6):
             y = LANE_TOP_MARGIN + i * layout.lane_height
-            bg = t.lane_bg_even if i % 2 == 0 else t.lane_bg_odd
-            pygame.draw.rect(
-                surface, bg,
-                (0, y, layout.screen_w, layout.lane_height),
-            )
+            bg = (20, 31, 46) if i % 2 == 0 else (18, 28, 42)
+            lane_rect = pygame.Rect(15, int(y), layout.screen_w - 30, int(layout.lane_height + 1))
+            pygame.draw.rect(surface, bg, lane_rect)
             # A centered string line makes the view read like tablature rather
             # than six large arcade lanes.
             line_y = int(y + layout.lane_height / 2)
             pygame.draw.line(
                 surface, t.lane_line,
-                (0, line_y), (layout.screen_w, line_y),
+                (56, line_y), (layout.screen_w - 26, line_y),
                 2,
             )
 
     def _draw_string_labels(self, surface: pygame.Surface, layout: _Layout) -> None:
         """Draw tuning labels above notes so every string stays identifiable."""
         t = get_theme()
-        font = _get_font("consolas", 18)
+        scale = max(1.0, min(1.45, layout.screen_h / 720.0))
+        font = _get_font("Segoe UI Semibold", int(15 * scale))
         for index, label in enumerate(STRING_LABELS):
             center_y = int(
                 LANE_TOP_MARGIN + index * layout.lane_height + layout.lane_height / 2
             )
             text = font.render(label, True, t.hud_text)
-            pad_x, pad_y = 8, 4
+            pad_x, pad_y = 9, 5
             bg_rect = pygame.Rect(
-                10,
+                25,
                 center_y - text.get_height() // 2 - pad_y,
                 text.get_width() + pad_x * 2,
                 text.get_height() + pad_y * 2,
             )
-            pygame.draw.rect(surface, t.bg, bg_rect, border_radius=6)
-            pygame.draw.rect(surface, t.lane_line, bg_rect, width=1, border_radius=6)
+            color = STRING_COLORS.get(index + 1, t.hud_text)
+            size = max(bg_rect.width, bg_rect.height)
+            bg_rect.width = size
+            bg_rect.height = size
+            bg_rect.centery = center_y
+            pygame.draw.ellipse(surface, (9, 16, 26), bg_rect)
+            pygame.draw.ellipse(surface, color, bg_rect, width=3)
             surface.blit(
                 text,
                 (bg_rect.centerx - text.get_width() // 2,
@@ -546,7 +631,17 @@ class PlayingScreen:
         x = int(layout.hit_zone_x)
         top = int(LANE_TOP_MARGIN)
         bottom = int(LANE_TOP_MARGIN + 6 * layout.lane_height)
-        pygame.draw.line(surface, t.hit_zone, (x, top), (x, bottom), 2)
+        glow = pygame.Surface((38, bottom - top), pygame.SRCALPHA)
+        for width, alpha in ((36, 9), (24, 16), (12, 28)):
+            pygame.draw.rect(
+                glow, (*t.hit_zone, alpha),
+                ((38 - width) // 2, 0, width, bottom - top),
+                border_radius=width // 2,
+            )
+        surface.blit(glow, (x - 19, top))
+        pygame.draw.line(surface, t.hit_zone, (x, top), (x, bottom), 4)
+        pygame.draw.circle(surface, (8, 13, 21), (x, top), 11)
+        pygame.draw.circle(surface, t.hit_zone, (x, top), 7)
 
     def _draw_notes(self, surface: pygame.Surface, layout: _Layout) -> None:
         t = get_theme()
@@ -556,8 +651,8 @@ class PlayingScreen:
 
         notes = self._timeline.get_notes_in_range(view_start, view_end)
 
-        fret_font_size = min(22, max(14, int(layout.note_h * 0.55)))
-        fret_font = _get_font("consolas", fret_font_size)
+        fret_font_size = min(30, max(17, int(layout.note_h * 0.48)))
+        fret_font = _get_font("Segoe UI Semibold", fret_font_size)
 
         for note in notes:
             # Difficulty filter: skip notes that fail
@@ -572,7 +667,7 @@ class PlayingScreen:
             fret_text = fret_font.render(fret_label, True, t.note_text)
             w = max(
                 self.note_width(note.duration_ms, layout.pixels_per_ms),
-                fret_text.get_width() + 12,
+                fret_text.get_width() + 20,
             )
 
             # Skip notes fully off-screen
@@ -594,26 +689,31 @@ class PlayingScreen:
                 color = dimmed(base_color) if past_hit_zone else base_color
 
             rect = pygame.Rect(int(x), int(y), int(w), int(layout.note_h))
+            shadow = rect.move(0, 5)
+            pygame.draw.rect(surface, (5, 9, 15), shadow, border_radius=NOTE_CORNER_RADIUS)
             pygame.draw.rect(surface, color, rect, border_radius=NOTE_CORNER_RADIUS)
-            pygame.draw.rect(surface, t.note_border, rect, width=2, border_radius=NOTE_CORNER_RADIUS)
+            border = tuple(min(255, channel + 35) for channel in color)
+            pygame.draw.rect(surface, border, rect, width=2, border_radius=NOTE_CORNER_RADIUS)
+            highlight = pygame.Rect(rect.x + 7, rect.y + 5, max(1, rect.width - 14), 3)
+            pygame.draw.rect(surface, (255, 255, 255), highlight, border_radius=2)
 
             # Always show the fret number, including on short notes.
             tx = rect.centerx - fret_text.get_width() // 2
             ty = rect.centery - fret_text.get_height() // 2
-            outline = fret_font.render(fret_label, True, (0, 0, 0))
-            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                surface.blit(outline, (tx + dx, ty + dy))
+            outline = fret_font.render(fret_label, True, (20, 25, 32))
+            surface.blit(outline, (tx + 1, ty + 2))
             surface.blit(fret_text, (tx, ty))
 
     def _draw_hud(self, surface: pygame.Surface, layout: _Layout) -> None:
         t = get_theme()
-        title_font = _get_font("arial", 19)
-        time_font = _get_font("consolas", 18)
-        hint_font = _get_font("arial", 13)
-
-        meta = self._timeline.metadata
         w = layout.screen_w
         h = layout.screen_h
+        scale = max(1.0, min(1.45, h / 720.0))
+        title_font = _get_font("Segoe UI Semibold", int(22 * scale))
+        time_font = _get_font("Segoe UI", int(16 * scale))
+        hint_font = _get_font("Segoe UI", int(13 * scale))
+
+        meta = self._timeline.metadata
 
         # Count-in overlay — large centered beat countdown
         if self._playback_ms < 0 and self._count_in_ms > 0:
@@ -635,20 +735,35 @@ class PlayingScreen:
 
         # Top-left: title + artist
         title = meta.title or "Untitled"
-        if meta.artist:
-            title = f"{meta.artist} — {title}"
-        title = self._ellipsize_text(title, title_font, int(w * 0.43))
+        title = self._ellipsize_text(title, title_font, int(w * 0.38))
         title_surf = title_font.render(title, True, t.hud_text)
-        surface.blit(title_surf, (12, 12))
+        surface.blit(title_surf, (28, 34))
+        eyebrow_font = _get_font("Segoe UI Semibold", int(11 * scale))
+        eyebrow = eyebrow_font.render("NOW PRACTICING", True, t.hud_accent)
+        surface.blit(eyebrow, (29, 15))
+        subtitle = meta.artist or meta.track_name or "Guitar lesson"
+        current_section = self._structure.section_at(max(0.0, self._playback_ms))
+        if current_section is not None:
+            subtitle += (
+                f"   •   {current_section.label}   •   "
+                f"bars {current_section.start_measure + 1}-{current_section.end_measure + 1}"
+            )
+        subtitle = self._ellipsize_text(subtitle, hint_font, int(w * 0.40))
+        subtitle_surf = hint_font.render(subtitle, True, (137, 154, 176))
+        surface.blit(subtitle_surf, (29, 66))
 
         # Top-center: BPM with tempo percentage (and streak below it)
         pct = int(self._tempo_factor * 100)
-        bpm_text = f"{meta.tempo} BPM ({pct}%)"
+        bpm_text = f"{pct}%   •   {meta.tempo} BPM"
         bpm_surf = title_font.render(bpm_text, True, t.hud_accent)
-        surface.blit(bpm_surf, (w // 2 - bpm_surf.get_width() // 2, 12))
+        tempo_box = bpm_surf.get_rect(center=(w // 2, 46)).inflate(38, 22)
+        pygame.draw.rect(surface, (19, 40, 49), tempo_box.move(0, 3), border_radius=15)
+        pygame.draw.rect(surface, (24, 54, 62), tempo_box, border_radius=15)
+        pygame.draw.rect(surface, (55, 104, 105), tempo_box, 1, border_radius=15)
+        surface.blit(bpm_surf, bpm_surf.get_rect(center=tempo_box.center))
 
         # Loop status below BPM
-        loop_y = 36
+        loop_y = 80
         loop_info = self._loop_hud_text()
         if loop_info:
             loop_color = t.hud_accent if self._loop_enabled else t.hud_text
@@ -672,28 +787,62 @@ class PlayingScreen:
         total = format_time(self._timeline.duration_ms)
         time_text = f"{current} / {total}"
         time_surf = time_font.render(time_text, True, t.hud_text)
-        surface.blit(time_surf, (w - time_surf.get_width() - 12, 12))
+        time_label = time_font.render("TIME", True, (122, 140, 162))
+        time_x = w - max(time_surf.get_width(), time_label.get_width()) - 29
+        surface.blit(time_label, (time_x, 17))
+        surface.blit(time_surf, (w - time_surf.get_width() - 28, 39))
+
+        self._draw_structure_map(surface, hint_font, w)
 
         # Top-right second line: accuracy stats
-        stats_bottom_y = 36
+        stats_bottom_y = 70
         if self._audio_enabled and self._matcher is not None:
             stats = self._matcher.get_statistics()
             if stats["total"] > 0:
-                self._feedback.draw_stats(surface, stats, hint_font, w - 12, 36)
-                stats_bottom_y = 54
+                accuracy = f"{stats['accuracy_percent']:.0f}% ACCURACY"
+                acc_surf = hint_font.render(accuracy, True, t.feedback_hit)
+                surface.blit(acc_surf, (w - acc_surf.get_width() - 180, 77))
+                stats_bottom_y = 70
 
         # Top-right: noise gate + signal meter + tuner (below stats, when audio capture exists)
         if self._audio_enabled:
-            gate_text = f"Gate: {int(self._noise_gate_db)} dB"
-            gate_surf = hint_font.render(gate_text, True, t.hud_accent)
-            surface.blit(gate_surf, (w - gate_surf.get_width() - 12, stats_bottom_y))
+            gate_text = (
+                f"GATE {int(self._noise_gate_db)} dB   •   "
+                f"LAT {self._config.audio_latency_offset_ms:+.0f} ms"
+            )
+            gate_surf = hint_font.render(gate_text, True, (123, 143, 166))
+            surface.blit(gate_surf, (w - gate_surf.get_width() - 28, stats_bottom_y))
             if self._audio_capture is not None:
-                self._draw_signal_meter(surface, hint_font, w, stats_bottom_y + 18)
-                self._draw_tuner(surface, hint_font, w, stats_bottom_y + 36)
+                self._draw_signal_meter(surface, hint_font, w, stats_bottom_y + 22)
+                self._draw_tuner(surface, hint_font, w, stats_bottom_y + 45)
+                if self._show_latency_details:
+                    diag = self._audio_capture.get_latency_diagnostics()
+                    diag_text = (
+                        f"{diag['sample_rate'] / 1000:.1f}K AUDIO  "
+                        f"IN {diag['device_ms']:.0f}  "
+                        f"BUF {diag['block_ms']:.0f}  "
+                        f"DET {diag['detector_ms']:.0f}  "
+                        f"EST {diag['estimated_ms']:.0f} ms  "
+                        f"ARP {diag['guided_hits']}"
+                    )
+                    diag_surf = hint_font.render(diag_text, True, t.hud_accent)
+                    surface.blit(diag_surf, (w - diag_surf.get_width() - 28, 116))
         elif self._audio_capture is not None:
             # Audio off but capture exists — still show meter and tuner
             self._draw_signal_meter(surface, hint_font, w, stats_bottom_y)
             self._draw_tuner(surface, hint_font, w, stats_bottom_y + 18)
+
+        if self._audio_error:
+            error_text = self._ellipsize_text(
+                f"MIC ERROR: {self._audio_error}  |  ESC, then D to choose Microphone Array",
+                hint_font,
+                w - 24,
+            )
+            error_surf = hint_font.render(error_text, True, t.feedback_miss)
+            surface.blit(error_surf, (12, 104))
+
+        if self._wait_mode_frozen:
+            self._draw_wait_prompt(surface, layout)
 
         # Bottom-center: play state + controls
         if self._playback_ms < 0:
@@ -717,41 +866,40 @@ class PlayingScreen:
             wait_state = f"|  W: wait {'WAIT' if self._wait_mode_frozen else 'ON'}  "
         elif self._audio_enabled:
             wait_state = "|  W: wait off  "
+        timing_state = ""
+        if self._matcher is not None:
+            timing_stats = self._matcher.get_statistics()
+            mean_timing = timing_stats.get("mean_timing_error_ms")
+            timed_notes = timing_stats.get("hits", 0) + timing_stats.get("close", 0)
+            if mean_timing is not None and timed_notes >= 3:
+                direction = "LATE" if mean_timing > 0 else "EARLY"
+                timing_state = f"     AVG {abs(mean_timing):.0f}ms {direction}"
         status = (
-            f"{state}   Tempo {int(self._tempo_factor * 100)}%   "
-            f"Audio {audio_state}   Wait {'ON' if self._wait_mode else 'off'}   "
-            f"Loop {loop_state}"
+            f"{state}     MIC {audio_state}     "
+            f"WAIT {'ON' if self._wait_mode else 'OFF'}     LOOP {loop_state.upper()}"
+            f"{timing_state}"
         )
-        controls = (
-            "SPACE Play/Pause   LEFT/RIGHT Seek   PgUp/PgDn Tempo   "
-            "I/O Loop   W Wait   H Help   ESC Menu"
-        )
+        controls = "SPACE  Play/Pause     TAB  Section     W  Wait     F7/F8  Offset     F10  Latency     F11  Fullscreen     ESC  Menu"
         footer_y = layout.screen_h - LANE_BOTTOM_MARGIN
         status_surf = hint_font.render(status, True, t.hud_accent)
-        controls_surf = hint_font.render(controls, True, t.hud_text)
+        controls_surf = hint_font.render(controls, True, (145, 160, 180))
         surface.blit(
             status_surf,
-            (w // 2 - status_surf.get_width() // 2, footer_y + 7),
+            (w // 2 - status_surf.get_width() // 2, footer_y + 16),
         )
         surface.blit(
             controls_surf,
-            (w // 2 - controls_surf.get_width() // 2, footer_y + 30),
+            (w // 2 - controls_surf.get_width() // 2, footer_y + 53),
         )
 
         # Top-left second line: track name + filter info
-        info_y = 38
-        if meta.track_name:
-            track_surf = hint_font.render(
-                f"Track: {meta.track_name}", True, t.hud_text
-            )
-            surface.blit(track_surf, (12, info_y))
-            info_y += 16
+        info_y = 92
 
         # Difficulty filter HUD
         filter_text = self._filter_hud_text()
         if filter_text:
             filter_surf = hint_font.render(filter_text, True, t.hud_accent)
-            surface.blit(filter_surf, (12, info_y))
+            surface.blit(filter_surf, (18, info_y))
             info_y += 16
 
         # Chord mode HUD
@@ -759,6 +907,76 @@ class PlayingScreen:
             chord_text = "Chords: strict" if self._chord_partial_credit else "Chords: easy"
             chord_surf = hint_font.render(chord_text, True, t.hud_accent)
             surface.blit(chord_surf, (12, info_y))
+
+    def _draw_wait_prompt(self, surface: pygame.Surface, layout: _Layout) -> None:
+        """Show an unmistakable but unobtrusive cue while practice is paused."""
+        t = get_theme()
+        font = _get_font("Segoe UI Semibold", 18)
+        text = font.render("YOUR TURN  •  PLAY THE NOTE", True, (9, 24, 27))
+        box = text.get_rect(center=(layout.hit_zone_x + 105, LANE_TOP_MARGIN + 22)).inflate(32, 16)
+        # Keep the pill fully visible even on narrow windows.
+        box.left = max(10, box.left)
+        box.right = min(layout.screen_w - 10, box.right)
+        pygame.draw.rect(surface, t.hud_accent, box, border_radius=box.height // 2)
+        surface.blit(text, text.get_rect(center=box.center))
+
+    def _draw_structure_map(
+        self,
+        surface: pygame.Surface,
+        font: pygame.font.Font,
+        screen_w: int,
+    ) -> None:
+        """Draw detected sections as a compact map of the whole song."""
+        x, y = 28, 126
+        width = max(40, screen_w - 56)
+        height = 18
+        structure_end = (
+            self._structure.sections[-1].end_ms if self._structure.sections else 0.0
+        )
+        total = max(1.0, self._timeline.duration_ms, structure_end)
+        pygame.draw.rect(surface, (26, 37, 51), (x, y, width, height), border_radius=7)
+
+        family_colors: dict[str, tuple[int, int, int]] = {}
+        for section in self._structure.sections:
+            if section.family not in family_colors:
+                family_colors[section.family] = SECTION_COLORS[
+                    len(family_colors) % len(SECTION_COLORS)
+                ]
+            left = x + int((section.start_ms / total) * width)
+            right = x + int((section.end_ms / total) * width)
+            rect = pygame.Rect(left + 1, y + 1, max(3, right - left - 2), height - 2)
+            color = family_colors[section.family]
+            pygame.draw.rect(surface, color, rect, border_radius=5)
+
+            if rect.width >= 88:
+                label = section.label
+                if section.occurrence_count > 1:
+                    label += f" {section.occurrence}/{section.occurrence_count}"
+                label_surf = font.render(label, True, (8, 15, 22))
+                if label_surf.get_width() <= rect.width - 10:
+                    surface.blit(label_surf, label_surf.get_rect(center=rect.center))
+
+        progress = max(0.0, min(1.0, self._playback_ms / total))
+        cursor_x = x + int(progress * width)
+        pygame.draw.line(
+            surface, (255, 255, 255),
+            (cursor_x, y - 3), (cursor_x, y + height + 3), 2,
+        )
+
+    def _seek_adjacent_section(self, direction: int) -> None:
+        """Jump to the previous or next detected practice section."""
+        sections = self._structure.sections
+        if not sections:
+            return
+        current = self._structure.section_at(max(0.0, self._playback_ms))
+        try:
+            index = sections.index(current) if current is not None else 0
+        except ValueError:
+            index = 0
+        target = max(0, min(len(sections) - 1, index + direction))
+        if direction < 0 and current is not None and self._playback_ms - current.start_ms > 800:
+            target = index
+        self.seek(sections[target].start_ms)
 
     @staticmethod
     def _ellipsize_text(text: str, font: pygame.font.Font, max_width: int) -> str:
@@ -1063,10 +1281,14 @@ class PlayingScreen:
 
         controls = [
             "SPACE: play/pause    LEFT/RIGHT: seek    HOME: restart",
+            "TAB: next section    SHIFT+TAB: previous section",
             "A: toggle audio    PgDn/PgUp: tempo    X/C: noise gate",
             "B: backing track    T: theme    I/O: loop markers    P: toggle loop",
             "F: fret limit    F1-F6: toggle strings    V: chord mode    L: loop weakest",
             "W: wait mode (pause until correct note played)",
+            "F7 / F8: latency -/+ 10 ms    F9: reset latency to automatic",
+            "F10: live latency diagnostics",
+            "F11: switch fullscreen / windowed mode",
         ]
         for line in controls:
             surf = hint_font.render(line, True, t.hud_text)
@@ -1149,6 +1371,24 @@ class PlayingScreen:
         self._config.save()
         if not self._wait_mode:
             self._wait_mode_frozen = False
+            self._wait_mode_hold_ms = None
+
+    # -- Latency compensation --
+
+    def _adjust_latency(self, delta_ms: float) -> None:
+        """Fine-tune timing compensation for the current Windows device."""
+        self._set_latency_offset(self._config.audio_latency_offset_ms + delta_ms)
+
+    def _set_latency_offset(self, value_ms: float) -> None:
+        """Save a bounded manual correction and apply it to the live matcher."""
+        old_value = self._config.audio_latency_offset_ms
+        new_value = max(-250.0, min(250.0, round(value_ms / 10.0) * 10.0))
+        self._config.audio_latency_offset_ms = new_value
+        if self._matcher is not None:
+            # Matcher time follows the slowed song clock, so a real-world
+            # device delay must be scaled by the active tempo factor.
+            self._matcher.audio_offset_ms += (new_value - old_value) * self._tempo_factor
+        self._config.save()
 
     # -- Loop weakest section --
 
@@ -1294,18 +1534,29 @@ class PlayingScreen:
             if self._audio_capture is None:
                 self._audio_capture = AudioCapture(self._config)
             self._audio_capture.start()
+            self._audio_error = None
+            self._audio_started_at = time.perf_counter()
             self._matcher = NoteMatcher(
                 self._timeline,
                 timing_window_ms=self._config.timing_window_ms,
-                audio_offset_ms=self._playback_ms + self._config.audio_latency_offset_ms,
+                audio_offset_ms=(
+                    self._playback_ms
+                    + self._config.audio_latency_offset_ms * self._tempo_factor
+                ),
                 chord_threshold_ms=self._config.chord_threshold_ms,
                 note_filter=self._note_passes_filter if self._is_filter_active() else None,
                 chord_partial_credit=self._chord_partial_credit,
             )
+            target = self._matcher.expected_target_at(self._playback_ms)
+            if target is None:
+                self._audio_capture.set_expected_notes(())
+            else:
+                target_time, target_midis = target
+                self._audio_capture.set_expected_notes(target_midis, target_time)
             self._feedback.reset()
         except Exception as e:
             print(f"Audio start failed: {e}")
-            self._audio_enabled = False
+            self._audio_error = str(e)
 
     def _start_capture_only(self) -> None:
         """Start audio capture for signal monitoring (no matcher)."""
@@ -1313,10 +1564,18 @@ class PlayingScreen:
             from pickhero.audio.input import AudioCapture
             if self._audio_capture is None:
                 self._audio_capture = AudioCapture(self._config)
+            self._audio_capture.set_expected_notes(())
             self._audio_capture.start()
+            self._audio_error = None
+            self._audio_started_at = time.perf_counter()
         except Exception as e:
             print(f"Audio capture start failed: {e}")
-            self._audio_enabled = False
+            self._audio_error = str(e)
+
+    def start_monitoring(self) -> None:
+        """Start the input meter before playback, including while paused."""
+        if self._audio_enabled:
+            self._start_capture_only()
 
     def _stop_audio(self) -> None:
         """Stop audio capture."""

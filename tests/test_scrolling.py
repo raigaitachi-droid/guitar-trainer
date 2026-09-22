@@ -168,6 +168,33 @@ class TestPlaybackClock:
         screen.seek(999999)
         assert screen._playback_ms == timeline.duration_ms
 
+    def test_wait_mode_stays_locked_to_note_between_frames(self, monkeypatch):
+        from pickhero.matcher import NoteMatcher
+
+        note = NoteEvent(1000.0, 500.0, 64, 1, 5)
+        timeline = _make_timeline(notes=[note])
+        screen = PlayingScreen(timeline)
+        screen._wait_mode = True
+        screen._audio_enabled = True
+        screen._matcher = NoteMatcher(timeline)
+        screen._playing = True
+        screen._playback_ms = 995.0
+        screen._last_tick = 1.0
+
+        times = iter((1.02, 1.04))
+        monkeypatch.setattr(
+            "pickhero.ui.scrolling.time.perf_counter",
+            lambda: next(times),
+        )
+
+        screen.update()
+        assert screen._wait_mode_frozen
+        assert screen._playback_ms == pytest.approx(1000.0)
+
+        screen.update()
+        assert screen._wait_mode_frozen
+        assert screen._playback_ms == pytest.approx(1000.0)
+
 
 class TestTempoFactor:
     """Test tempo factor (speed adjustment) logic."""

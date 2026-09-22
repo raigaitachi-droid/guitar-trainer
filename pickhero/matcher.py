@@ -136,14 +136,58 @@ class NoteMatcher:
 
     def has_pending_notes_at(self, playback_ms: float) -> bool:
         """Return True if there are unmatched notes at or before playback_ms."""
+        return self.pending_note_time_at(playback_ms) is not None
+
+    def pending_note_time_at(self, playback_ms: float) -> float | None:
+        """Return the earliest unmatched note time at the playhead, if any."""
         window_start = playback_ms - self._timing_window_ms
         candidates = self._timeline.get_notes_in_range(window_start, playback_ms + 1)
         for note in candidates:
             if self._is_filtered(note):
                 continue
             if self._get_state(note) == MatchType.PENDING:
-                return True
-        return False
+                return note.timestamp_ms
+        return None
+
+    def expected_midi_notes_at(
+        self,
+        playback_ms: float,
+        lookahead_ms: float | None = None,
+    ) -> tuple[int, ...]:
+        """Return the earliest pending tab pitch group near the playhead.
+
+        This small target set guides polyphonic arpeggio detection. It never
+        exposes later notes at the same time, preventing a ringing string from
+        stealing a future event.
+        """
+        target = self.expected_target_at(playback_ms, lookahead_ms)
+        return target[1] if target is not None else ()
+
+    def expected_target_at(
+        self,
+        playback_ms: float,
+        lookahead_ms: float | None = None,
+    ) -> tuple[float, tuple[int, ...]] | None:
+        """Return (event timestamp, MIDI pitches) for the next pending group."""
+        if lookahead_ms is None:
+            lookahead_ms = self._timing_window_ms
+        candidates = self._timeline.get_notes_in_range(
+            playback_ms - self._timing_window_ms,
+            playback_ms + max(0.0, lookahead_ms) + 0.001,
+        )
+        pending = [
+            note for note in candidates
+            if self._get_state(note) == MatchType.PENDING
+            and not self._is_filtered(note)
+        ]
+        if not pending:
+            return None
+        earliest = min(note.timestamp_ms for note in pending)
+        midi_notes = tuple(sorted({
+            note.midi_note for note in pending
+            if abs(note.timestamp_ms - earliest) <= self._chord_threshold_ms
+        }))
+        return (earliest, midi_notes)
 
     def _mark_missed_notes(self, playback_ms: float) -> list[MatchResult]:
         """Mark PENDING notes that have passed the timing window as MISS."""
@@ -168,13 +212,19 @@ class NoteMatcher:
         return results
 
     def process_detected_notes(
-        self, detected: list[TimestampedNote], playback_ms: float
+        self,
+        detected: list[TimestampedNote],
+        playback_ms: float,
+        allow_sustained: bool = False,
     ) -> list[MatchResult]:
         """Process detected notes against the timeline.
 
         Args:
             detected: Notes from AudioCapture.get_notes()
             playback_ms: Current playback position in the song
+            allow_sustained: Accept confident pitch frames without a fresh
+                onset. Used by Wait Mode after playback has frozen, where the
+                player may already be sustaining the expected note.
 
         Returns:
             List of match results for this frame.
@@ -184,10 +234,15 @@ class NoteMatcher:
         # First, mark any notes that have passed the window as missed
         results.extend(self._mark_missed_notes(playback_ms))
 
-        # Process each detected note with an onset
+        # Normal scoring uses picked onsets for accurate timing. Wait Mode may
+        # also accept a sustained confident pitch so a missed onset does not
+        # leave playback stuck forever.
         for ts_note in detected:
             if not ts_note.note.is_onset:
-                continue
+                # Sustained YIN output can be the previous ringing string.
+                # Only the tab-guided detector has re-articulation protection.
+                if not allow_sustained or ts_note.note.source != "guided":
+                    continue
 
             adjusted_ms = ts_note.timestamp_ms + self._audio_offset_ms
             detected_midi = ts_note.note.midi_note
@@ -209,9 +264,10 @@ class NoteMatcher:
                 continue
 
             def effective_pitch_distance(note: NoteEvent) -> int:
-                dist = semitone_distance(detected_midi, note.midi_note)
-                octave_dist = dist % 12 if dist >= 12 else dist
-                return min(dist, octave_dist)
+                # Octaves are different frets/strings and must not count as
+                # the same note. The old pitch-class shortcut made a ringing
+                # lower arpeggio note complete an upcoming upper octave.
+                return semitone_distance(detected_midi, note.midi_note)
 
             # Timing is the primary signal. This prevents a same-pitch future
             # note from stealing a detection from the note at the playhead.
@@ -310,6 +366,10 @@ class NoteMatcher:
             sum(abs(error) for error in timing_errors) / len(timing_errors)
             if timing_errors else None
         )
+        mean_timing_error = (
+            sum(timing_errors) / len(timing_errors)
+            if timing_errors else None
+        )
         return {
             "hits": self.hits,
             "close": self.close,
@@ -318,6 +378,7 @@ class NoteMatcher:
             "total": total,
             "accuracy_percent": accuracy,
             "mean_abs_timing_error_ms": mean_abs_timing_error,
+            "mean_timing_error_ms": mean_timing_error,
             "early": sum(error < -25.0 for error in timing_errors),
             "on_time": sum(abs(error) <= 25.0 for error in timing_errors),
             "late": sum(error > 25.0 for error in timing_errors),
